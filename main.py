@@ -1,10 +1,12 @@
 import argparse
 import sys
 
+from multi_doc_chat.config.settings import get_settings
 from multi_doc_chat.exception.exceptions import MultiDocChatError
 from multi_doc_chat.logger.logger import get_logger
+from multi_doc_chat.session.session import create_session
 from multi_doc_chat.src.ingestion import IngestionPipeline
-from multi_doc_chat.src.retrieval import ConversationalRAGEngine, RAGQueryEngine
+from multi_doc_chat.src.retrieval import ConversationalRAGEngine, RAGQueryEngine, build_mmr_retriever
 
 logger = get_logger(__name__)
 
@@ -41,9 +43,49 @@ def cmd_query_sources(args: argparse.Namespace) -> None:
     print()
 
 
-def cmd_chat(args: argparse.Namespace) -> None:
+def cmd_run(args: argparse.Namespace) -> None:
+    """Session-scoped run: generate session → ingest data/ → MMR retriever → chat loop."""
+    settings = get_settings()
+
+    # 1. Generate session
+    session = create_session()
+    print(f"Session : {session.id}")
+    print(f"Started : {session.created_at.strftime('%Y-%m-%d %H:%M:%S')}")
+    print()
+
+    # 2. Initialize chat ingestor and ingest from data/
+    print("Ingesting documents…")
+    pipeline = IngestionPipeline(settings)
+    result = pipeline.run(vectorstore_dir=session.vectorstore_dir)
+    print(f"  Documents loaded : {result.files_loaded}")
+    print(f"  Chunks created   : {result.chunks_created}")
+    if result.errors:
+        print(f"  Warnings         : {len(result.errors)} file(s) failed to load")
+        for err in result.errors:
+            print(f"    - {err}")
+    print()
+
+    # 3. Build MMR retriever for diverse results
+    print("Building retriever (MMR)…")
+    retriever = build_mmr_retriever(session.vectorstore_dir, settings)
+    print(
+        f"  k={settings.retriever_k}  fetch_k={settings.mmr_fetch_k}"
+        f"  lambda={settings.mmr_lambda_mult}"
+    )
+    print()
+
+    # 4. Initialize conversational RAG with the MMR retriever
+    #    (contextualize + QA prompts are wired inside ConversationalRAGEngine)
+    engine = ConversationalRAGEngine(settings=settings, retriever=retriever)
+
+    # 5. Start the interactive multi-turn loop
+    cmd_chat(args, engine=engine)
+
+
+def cmd_chat(args: argparse.Namespace, engine: ConversationalRAGEngine | None = None) -> None:
     """Run an interactive multi-turn chat session against the indexed documents."""
-    engine = ConversationalRAGEngine()
+    if engine is None:
+        engine = ConversationalRAGEngine()
     print("Chat session started. Type 'exit' or press Ctrl-C to quit.\n")
     while True:
         try:
@@ -96,6 +138,12 @@ def build_parser() -> argparse.ArgumentParser:
         help="Start an interactive multi-turn chat session against your documents.",
     )
 
+    # run subcommand — session-scoped: ingest data/ → MMR retriever → chat
+    subparsers.add_parser(
+        "run",
+        help="Ingest documents from data/ in a new session, then start an interactive chat.",
+    )
+
     return parser
 
 
@@ -111,6 +159,8 @@ def main() -> None:
             cmd_query_sources(args)
         elif args.command == "chat":
             cmd_chat(args)
+        elif args.command == "run":
+            cmd_run(args)
     except MultiDocChatError as exc:
         logger.error("Application error: %s", exc)
         print(f"Error: {exc}", file=sys.stderr)

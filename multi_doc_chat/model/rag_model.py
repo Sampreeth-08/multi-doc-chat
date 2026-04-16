@@ -1,6 +1,15 @@
 from dataclasses import dataclass, field
 from typing import List
 
+from pydantic import BaseModel, Field
+
+
+class CoTAnswer(BaseModel):
+    """Structured LLM output for chain-of-thought QA."""
+
+    reasoning: str = Field(description="Step-by-step reasoning through the provided context")
+    answer: str = Field(description="Concise final answer to the question")
+
 
 @dataclass
 class QueryRequest:

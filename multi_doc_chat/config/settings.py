@@ -23,8 +23,11 @@ class Settings:
     chunk_size: int
     chunk_overlap: int
     retriever_k: int
+    mmr_fetch_k: int
+    mmr_lambda_mult: float
     data_dir: Path
     vectorstore_dir: Path
+    sessions_dir: Path
 
 
 _settings_instance: Settings | None = None
@@ -55,9 +58,12 @@ def get_settings() -> Settings:
         openai_embedding_model=os.getenv("OPENAI_EMBEDDING_MODEL", "text-embedding-3-small").strip(),
         chunk_size=int(os.getenv("CHUNK_SIZE", "1000")),
         chunk_overlap=int(os.getenv("CHUNK_OVERLAP", "200")),
-        retriever_k=int(os.getenv("RETRIEVER_K", "4")),
+        retriever_k=int(os.getenv("RETRIEVER_K", "5")),
+        mmr_fetch_k=int(os.getenv("MMR_FETCH_K", "20")),
+        mmr_lambda_mult=float(os.getenv("MMR_LAMBDA_MULT", "0.5")),
         data_dir=_PROJECT_ROOT / os.getenv("DATA_DIR", "data"),
         vectorstore_dir=_PROJECT_ROOT / os.getenv("VECTORSTORE_DIR", "vectorstore"),
+        sessions_dir=_PROJECT_ROOT / os.getenv("SESSIONS_DIR", "sessions"),
     )
 
     return _settings_instance

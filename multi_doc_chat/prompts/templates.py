@@ -10,6 +10,17 @@ Context:
 {context}
 """
 
+COT_SYSTEM_TEMPLATE = """\
+You are a helpful assistant that answers questions strictly based on the \
+provided context documents. Think through the problem step by step before \
+giving your final answer. If the answer cannot be found in the context, \
+say so in your reasoning and answer "I don't have enough information to \
+answer that question." Do not fabricate information.
+
+Context:
+{context}
+"""
+
 # Used by the history-aware retriever to rewrite follow-up questions into
 # standalone questions that make sense without the chat history.
 CONTEXTUALIZE_SYSTEM_TEMPLATE = """\
@@ -42,6 +53,24 @@ def build_conversational_qa_prompt() -> ChatPromptTemplate:
     return ChatPromptTemplate.from_messages(
         [
             ("system", SYSTEM_TEMPLATE),
+            MessagesPlaceholder("chat_history"),
+            ("human", "{input}"),
+        ]
+    )
+
+
+def build_cot_conversational_qa_prompt() -> ChatPromptTemplate:
+    """CoT QA prompt for the conversational RAG chain.
+
+    Instructs the LLM to reason step by step. Used with
+    ``llm.with_structured_output(CoTAnswer)`` to produce a
+    ``{reasoning, answer}`` response.
+
+    Placeholders: ``{context}``, ``{chat_history}``, ``{input}``.
+    """
+    return ChatPromptTemplate.from_messages(
+        [
+            ("system", COT_SYSTEM_TEMPLATE),
             MessagesPlaceholder("chat_history"),
             ("human", "{input}"),
         ]

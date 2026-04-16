@@ -4,6 +4,7 @@ from typing import List
 from langchain_community.document_loaders import Docx2txtLoader, PyPDFLoader, TextLoader
 from langchain_community.vectorstores import FAISS
 from langchain_core.documents import Document
+from langchain_core.runnables import RunnableLambda
 from langchain_openai import OpenAIEmbeddings
 from langchain_text_splitters import RecursiveCharacterTextSplitter
 
@@ -72,6 +73,42 @@ class DocumentLoader:
                 file_path=str(file_path),
                 reason=str(exc),
             ) from exc
+
+    def load_files(self, file_paths: List[Path]) -> List[Document]:
+        """Load a specific list of files and return their Documents.
+
+        Logs a WARNING and continues on per-file errors so one bad file does
+        not abort the whole upload batch.
+
+        Args:
+            file_paths: Explicit list of file paths to load.
+
+        Returns:
+            List[Document]: Combined documents from all successfully loaded files.
+
+        Raises:
+            DocumentLoadError: If no documents could be loaded from any file.
+        """
+        logger.info("Loading %d uploaded file(s)…", len(file_paths))
+        all_documents: List[Document] = []
+        errors: List[str] = []
+
+        for file_path in file_paths:
+            try:
+                docs = self.load_file(file_path)
+                all_documents.extend(docs)
+                logger.info("Successfully loaded: %s (%d doc(s))", file_path.name, len(docs))
+            except (DocumentLoadError, UnsupportedFileTypeError) as exc:
+                logger.warning("Skipping file due to load error: %s", exc)
+                errors.append(str(exc))
+
+        if not all_documents:
+            msg = "No documents could be loaded from the uploaded files."
+            if errors:
+                msg += f" Errors: {'; '.join(errors)}"
+            raise DocumentLoadError(file_path="<uploaded files>", reason=msg)
+
+        return all_documents
 
     def load_directory(self, data_dir: Path | None = None) -> List[Document]:
         """Load all supported files under data_dir.
@@ -167,14 +204,16 @@ class VectorStoreBuilder:
             base_url=self._settings.openai_base_url,
         )
 
-    def build_and_save(self, chunks: List[Document]) -> None:
+    def build_and_save(self, chunks: List[Document], vectorstore_dir: Path | None = None) -> None:
         """Embed chunks with OpenAI and persist the FAISS index to disk.
 
-        The index is saved to settings.vectorstore_dir as two files:
-        ``index.faiss`` (the ANN index) and ``index.pkl`` (the docstore).
+        The index is saved as two files: ``index.faiss`` (the ANN index) and
+        ``index.pkl`` (the docstore).
 
         Args:
             chunks: Chunked documents to embed and index.
+            vectorstore_dir: Override the destination directory. Defaults to
+                ``settings.vectorstore_dir``.
 
         Raises:
             VectorStoreError: If embedding or FAISS operations fail.
@@ -185,11 +224,11 @@ class VectorStoreBuilder:
         except Exception as exc:
             raise VectorStoreError(f"Failed to build FAISS index: {exc}") from exc
 
-        self._save(vectorstore)
+        self._save(vectorstore, vectorstore_dir)
 
-    def _save(self, vectorstore: FAISS) -> None:
+    def _save(self, vectorstore: FAISS, vectorstore_dir: Path | None = None) -> None:
         """Persist the FAISS index and docstore pickle to vectorstore_dir."""
-        dest = self._settings.vectorstore_dir
+        dest = vectorstore_dir or self._settings.vectorstore_dir
         ensure_dir(dest)
         try:
             vectorstore.save_local(str(dest))
@@ -207,45 +246,81 @@ class IngestionPipeline:
         self.chunker = DocumentChunker(self._settings)
         self.builder = VectorStoreBuilder(self._settings)
 
-    def run(self, data_dir: Path | None = None) -> IngestionResult:
+    def _build_ingestion_chain(self, vectorstore_dir: Path | None = None):
+        """Build an LCEL chain that chunks documents then builds the vector store.
+
+        Chain structure:
+            RunnableLambda(chunk)
+            | RunnableLambda(build_and_save → chunk_count)
+
+        Accepts ``List[Document]`` and returns ``int`` (number of chunks created).
+
+        Args:
+            vectorstore_dir: Override destination for the FAISS index.
+        """
+        def _build_and_count(chunks: List[Document]) -> int:
+            self.builder.build_and_save(chunks, vectorstore_dir=vectorstore_dir)
+            return len(chunks)
+
+        return (
+            RunnableLambda(self.chunker.chunk)
+            | RunnableLambda(_build_and_count)
+        )
+
+    def run(
+        self,
+        data_dir: Path | None = None,
+        files: List[Path] | None = None,
+        vectorstore_dir: Path | None = None,
+    ) -> IngestionResult:
         """Execute the full ingestion pipeline end-to-end.
 
         Steps:
-          1. Load all supported files from data_dir
-          2. Chunk all loaded documents
-          3. Build and persist the FAISS vector store
+          1. Load documents — either from an explicit ``files`` list or from
+             all supported files under ``data_dir``
+          2. Chunk documents and build+persist the FAISS vector store via LCEL chain
 
         Args:
-            data_dir: Directory to ingest. Defaults to settings.data_dir.
+            data_dir: Directory to scan for documents. Ignored when ``files``
+                is provided. Defaults to ``settings.data_dir``.
+            files: Explicit list of file paths to ingest. Takes priority over
+                ``data_dir`` when provided.
+            vectorstore_dir: Override the directory where the FAISS index is
+                written. Defaults to ``settings.vectorstore_dir``.
 
         Returns:
             IngestionResult: Summary with counts and any per-file error messages.
         """
-        directory = data_dir or self._settings.data_dir
         errors: List[str] = []
+        dest = vectorstore_dir or self._settings.vectorstore_dir
 
-        logger.info("=== Ingestion pipeline started (source: %s) ===", directory)
+        if files is not None:
+            source_label = f"{len(files)} uploaded file(s)"
+        else:
+            source_label = str(data_dir or self._settings.data_dir)
+
+        logger.info("=== Ingestion pipeline started (source: %s) ===", source_label)
 
         # Step 1: Load
         try:
-            documents = self.loader.load_directory(directory)
+            if files is not None:
+                documents = self.loader.load_files(files)
+            else:
+                documents = self.loader.load_directory(data_dir)
         except DocumentLoadError as exc:
             logger.error("Ingestion failed at load stage: %s", exc)
             raise
 
         files_loaded = len(documents)
 
-        # Step 2: Chunk
-        chunks = self.chunker.chunk(documents)
-        chunks_created = len(chunks)
-
-        # Step 3: Build & save
-        self.builder.build_and_save(chunks)
+        # Steps 2 & 3: Chunk → embed → save via LCEL chain
+        chain = self._build_ingestion_chain(vectorstore_dir=vectorstore_dir)
+        chunks_created: int = chain.invoke(documents)
 
         result = IngestionResult(
             files_loaded=files_loaded,
             chunks_created=chunks_created,
-            vectorstore_path=str(self._settings.vectorstore_dir),
+            vectorstore_path=str(dest),
             errors=errors,
         )
         logger.info(

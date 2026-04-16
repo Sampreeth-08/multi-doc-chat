@@ -11,9 +11,11 @@ from langchain_openai import ChatOpenAI, OpenAIEmbeddings
 from multi_doc_chat.config.settings import Settings, get_settings
 from multi_doc_chat.exception.exceptions import QueryError, VectorStoreNotFoundError
 from multi_doc_chat.logger.logger import get_logger
+from multi_doc_chat.model.rag_model import CoTAnswer
 from multi_doc_chat.prompts.templates import (
     build_contextualize_prompt,
     build_conversational_qa_prompt,
+    build_cot_conversational_qa_prompt,
     build_qa_prompt,
 )
 
@@ -158,8 +160,10 @@ class ConversationalRAGEngine:
         engine.clear_history()  # start a fresh session
     """
 
-    def __init__(self, settings: Settings | None = None) -> None:
+    def __init__(self, settings: Settings | None = None, retriever=None, cot: bool = False) -> None:
         self._settings = settings or get_settings()
+        self._external_retriever = retriever  # optional pre-built retriever
+        self._cot = cot
         self._chat_history: List[BaseMessage] = []
         self._conv_chain = None  # built lazily on first chat() call
 
@@ -173,14 +177,20 @@ class ConversationalRAGEngine:
           2. Retrieve documents using the (possibly rewritten) question.
           3. Generate an answer conditioned on context + full chat history.
 
-        The chain accepts ``{"input": str, "chat_history": List[BaseMessage]}``
-        and returns a plain ``str`` answer.
+        When ``cot=True`` the final step uses ``llm.with_structured_output``
+        so the chain returns a ``CoTAnswer`` instead of a plain string.
+        When an external retriever is supplied it is used directly; otherwise
+        a similarity-search retriever is built from the default FAISS index.
         """
-        vectorstore = _load_faiss(self._settings)
-        retriever = vectorstore.as_retriever(
-            search_type="similarity",
-            search_kwargs={"k": self._settings.retriever_k},
-        )
+        if self._external_retriever is not None:
+            retriever = self._external_retriever
+            logger.debug("Using externally provided retriever.")
+        else:
+            vectorstore = _load_faiss(self._settings)
+            retriever = vectorstore.as_retriever(
+                search_type="similarity",
+                search_kwargs={"k": self._settings.retriever_k},
+            )
         llm = ChatOpenAI(
             model=self._settings.openai_model,
             api_key=self._settings.openai_api_key,
@@ -203,21 +213,36 @@ class ConversationalRAGEngine:
             docs = retriever.invoke(standalone_q)
             return _format_docs(docs)
 
-        self._conv_chain = (
+        base = (
             RunnablePassthrough.assign(
                 standalone_question=RunnableLambda(_get_standalone_question)
             )
             | RunnablePassthrough.assign(
                 context=RunnableLambda(_retrieve)
             )
-            | build_conversational_qa_prompt()
-            | llm
-            | StrOutputParser()
         )
-        logger.debug("Conversational RAG chain built successfully.")
+
+        if self._cot:
+            self._conv_chain = (
+                base
+                | build_cot_conversational_qa_prompt()
+                | llm.with_structured_output(CoTAnswer)
+            )
+            logger.debug("Conversational RAG chain built (CoT mode).")
+        else:
+            self._conv_chain = (
+                base
+                | build_conversational_qa_prompt()
+                | llm
+                | StrOutputParser()
+            )
+            logger.debug("Conversational RAG chain built successfully.")
 
     def chat(self, question: str) -> str:
         """Send a message and get a reply, maintaining full conversation context.
+
+        When ``cot=True`` this delegates to ``chat_with_reasoning`` and returns
+        only the final answer string.
 
         Args:
             question: The user's message (can be a follow-up referencing prior turns).
@@ -229,6 +254,9 @@ class ConversationalRAGEngine:
             VectorStoreNotFoundError: If the FAISS index has not been built yet.
             QueryError: If the chain invocation fails.
         """
+        if self._cot:
+            return self.chat_with_reasoning(question).answer
+
         if self._conv_chain is None:
             self._build_conv_chain()
 
@@ -242,12 +270,47 @@ class ConversationalRAGEngine:
         except Exception as exc:
             raise QueryError(f"Conversational chain invocation failed: {exc}") from exc
 
-        # Append this turn to history so the next question has full context
         self._chat_history.append(HumanMessage(content=question))
         self._chat_history.append(AIMessage(content=answer))
-
         logger.info("Conversational query answered (history length: %d turns).", len(self._chat_history) // 2)
         return answer
+
+    def chat_with_reasoning(self, question: str) -> CoTAnswer:
+        """Send a message and get a structured reply with step-by-step reasoning.
+
+        Requires the engine to be constructed with ``cot=True``.
+
+        Args:
+            question: The user's message.
+
+        Returns:
+            CoTAnswer: Pydantic model with ``reasoning`` and ``answer`` fields.
+
+        Raises:
+            ValueError: If called on an engine that was not built with ``cot=True``.
+            VectorStoreNotFoundError: If the FAISS index has not been built yet.
+            QueryError: If the chain invocation fails.
+        """
+        if not self._cot:
+            raise ValueError("chat_with_reasoning requires cot=True")
+
+        if self._conv_chain is None:
+            self._build_conv_chain()
+
+        logger.info("CoT query (turn %d): %r", len(self._chat_history) // 2 + 1, question)
+        try:
+            cot_answer: CoTAnswer = self._conv_chain.invoke(
+                {"input": question, "chat_history": self._chat_history}
+            )
+        except VectorStoreNotFoundError:
+            raise
+        except Exception as exc:
+            raise QueryError(f"CoT chain invocation failed: {exc}") from exc
+
+        self._chat_history.append(HumanMessage(content=question))
+        self._chat_history.append(AIMessage(content=cot_answer.answer))
+        logger.info("CoT query answered (history length: %d turns).", len(self._chat_history) // 2)
+        return cot_answer
 
     def clear_history(self) -> None:
         """Reset the chat history to start a fresh session."""
@@ -260,13 +323,54 @@ class ConversationalRAGEngine:
         return list(self._chat_history)
 
 
-def _load_faiss(settings: Settings) -> FAISS:
+def build_mmr_retriever(vectorstore_dir: Path, settings: Settings):
+    """Load a FAISS index and return a Maximal Marginal Relevance retriever.
+
+    MMR balances relevance and diversity: ``fetch_k`` candidates are retrieved,
+    then ``k`` are selected to maximise coverage of different information.
+    ``lambda_mult`` controls the relevance/diversity trade-off (0 = max
+    diversity, 1 = pure relevance).
+
+    Args:
+        vectorstore_dir: Path to the directory containing the FAISS index.
+        settings: Application settings (used for embedding model + MMR params).
+
+    Returns:
+        A LangChain retriever configured for MMR search.
+
+    Raises:
+        VectorStoreNotFoundError: If the index files are missing.
+    """
+    vectorstore = _load_faiss(settings, vectorstore_dir=vectorstore_dir)
+    retriever = vectorstore.as_retriever(
+        search_type="mmr",
+        search_kwargs={
+            "k": settings.retriever_k,
+            "fetch_k": settings.mmr_fetch_k,
+            "lambda_mult": settings.mmr_lambda_mult,
+        },
+    )
+    logger.debug(
+        "MMR retriever built (k=%d, fetch_k=%d, lambda_mult=%.2f)",
+        settings.retriever_k,
+        settings.mmr_fetch_k,
+        settings.mmr_lambda_mult,
+    )
+    return retriever
+
+
+def _load_faiss(settings: Settings, vectorstore_dir: Path | None = None) -> FAISS:
     """Shared helper: load the FAISS index from disk.
+
+    Args:
+        settings: Application settings (embedding model + credentials).
+        vectorstore_dir: Override the index directory. Defaults to
+            ``settings.vectorstore_dir``.
 
     Raises:
         VectorStoreNotFoundError: If the vectorstore directory or index file is missing.
     """
-    vectorstore_path = settings.vectorstore_dir
+    vectorstore_path = vectorstore_dir or settings.vectorstore_dir
     index_file = vectorstore_path / "index.faiss"
 
     if not vectorstore_path.exists() or not index_file.exists():
