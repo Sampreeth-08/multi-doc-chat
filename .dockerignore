@@ -1,0 +1,38 @@
+# Version control
+.git
+.gitignore
+
+# Python bytecode and caches
+__pycache__/
+*.py[oc]
+.pytest_cache/
+
+# Virtual environment (rebuilt inside Docker)
+.venv/
+
+# Secrets — never bake these into the image
+.env
+
+# Dev / test files
+test/
+test_api.py
+notebook/
+plan.md
+
+# Runtime-generated directories (mounted or created at startup)
+data/
+vectorstore/
+sessions/
+logs/
+
+# Build artifacts
+dist/
+build/
+*.egg-info/
+
+# Claude Code
+.claude/
+
+# Docker files themselves
+Dockerfile
+.dockerignore
