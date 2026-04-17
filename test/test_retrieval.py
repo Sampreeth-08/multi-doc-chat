@@ -3,9 +3,16 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 from langchain_core.documents import Document
+from langchain_core.messages import AIMessage, HumanMessage
 
 from multi_doc_chat.exception.exceptions import QueryError, VectorStoreNotFoundError
-from multi_doc_chat.src.retrieval import RAGQueryEngine, _format_docs
+from multi_doc_chat.model.rag_model import CoTAnswer
+from multi_doc_chat.src.retrieval import (
+    ConversationalRAGEngine,
+    RAGQueryEngine,
+    _format_docs,
+    build_mmr_retriever,
+)
 
 
 # ---------------------------------------------------------------------------
@@ -147,3 +154,139 @@ class TestRAGQueryEngine:
         assert "sources" in result
         assert result["answer"] == "Mock answer."
         assert isinstance(result["sources"], list)
+
+
+# ---------------------------------------------------------------------------
+# ConversationalRAGEngine
+# ---------------------------------------------------------------------------
+
+class TestConversationalRAGEngine:
+    def _engine_with_mock_chain(self, settings, cot=False):
+        """Return an engine with a pre-built mock chain to skip _build_conv_chain."""
+        engine = ConversationalRAGEngine(settings=settings, cot=cot)
+        fake_chain = MagicMock()
+        engine._conv_chain = fake_chain
+        return engine, fake_chain
+
+    # -- chat_with_reasoning --
+
+    def test_chat_with_reasoning_raises_when_cot_false(self, sample_settings):
+        engine = ConversationalRAGEngine(settings=sample_settings, cot=False)
+        engine._conv_chain = MagicMock()
+        with pytest.raises(ValueError, match="cot=True"):
+            engine.chat_with_reasoning("What is AI?")
+
+    def test_chat_with_reasoning_returns_cot_answer(self, sample_settings):
+        engine, fake_chain = self._engine_with_mock_chain(sample_settings, cot=True)
+        fake_chain.invoke.return_value = CoTAnswer(
+            reasoning="Step 1: analyse context.", answer="The answer."
+        )
+        result = engine.chat_with_reasoning("What is AI?")
+        assert isinstance(result, CoTAnswer)
+        assert result.answer == "The answer."
+        assert "Step 1" in result.reasoning
+
+    def test_chat_with_reasoning_appends_to_history(self, sample_settings):
+        engine, fake_chain = self._engine_with_mock_chain(sample_settings, cot=True)
+        fake_chain.invoke.return_value = CoTAnswer(reasoning="r", answer="ans")
+        engine.chat_with_reasoning("Q1")
+        assert len(engine.history) == 2
+        assert isinstance(engine.history[0], HumanMessage)
+        assert isinstance(engine.history[1], AIMessage)
+
+    def test_chat_with_reasoning_wraps_errors_in_query_error(self, sample_settings):
+        engine, fake_chain = self._engine_with_mock_chain(sample_settings, cot=True)
+        fake_chain.invoke.side_effect = RuntimeError("LLM timeout")
+        with pytest.raises(QueryError, match="LLM timeout"):
+            engine.chat_with_reasoning("Q?")
+
+    # -- chat (cot=False) --
+
+    def test_chat_returns_string_answer(self, sample_settings):
+        engine, fake_chain = self._engine_with_mock_chain(sample_settings, cot=False)
+        fake_chain.invoke.return_value = "Plain answer."
+        result = engine.chat("What is RAG?")
+        assert result == "Plain answer."
+
+    def test_chat_delegates_to_chat_with_reasoning_when_cot_true(self, sample_settings):
+        engine, fake_chain = self._engine_with_mock_chain(sample_settings, cot=True)
+        fake_chain.invoke.return_value = CoTAnswer(reasoning="r", answer="delegate answer")
+        result = engine.chat("What is RAG?")
+        assert result == "delegate answer"
+
+    def test_chat_accumulates_history_across_turns(self, sample_settings):
+        engine, fake_chain = self._engine_with_mock_chain(sample_settings, cot=False)
+        fake_chain.invoke.return_value = "answer"
+        engine.chat("Q1")
+        engine.chat("Q2")
+        assert len(engine.history) == 4  # 2 human + 2 AI messages
+
+    def test_chat_wraps_errors_in_query_error(self, sample_settings):
+        engine, fake_chain = self._engine_with_mock_chain(sample_settings, cot=False)
+        fake_chain.invoke.side_effect = RuntimeError("chain failure")
+        with pytest.raises(QueryError, match="chain failure"):
+            engine.chat("Q?")
+
+    # -- clear_history / history property --
+
+    def test_clear_history_resets_to_empty(self, sample_settings):
+        engine, fake_chain = self._engine_with_mock_chain(sample_settings, cot=False)
+        fake_chain.invoke.return_value = "a"
+        engine.chat("Q1")
+        assert len(engine.history) == 2
+        engine.clear_history()
+        assert engine.history == []
+
+    def test_history_property_returns_copy(self, sample_settings):
+        engine = ConversationalRAGEngine(settings=sample_settings)
+        hist = engine.history
+        hist.append(HumanMessage(content="injected"))
+        assert engine.history == []  # internal list unaffected
+
+    # -- lazy chain building --
+
+    def test_chain_built_only_once(self, sample_settings):
+        engine, fake_chain = self._engine_with_mock_chain(sample_settings, cot=False)
+        fake_chain.invoke.return_value = "a"
+        engine.chat("Q1")
+        engine.chat("Q2")
+        # Chain was pre-set; _conv_chain must still be the same object
+        assert engine._conv_chain is fake_chain
+        assert fake_chain.invoke.call_count == 2
+
+
+# ---------------------------------------------------------------------------
+# build_mmr_retriever
+# ---------------------------------------------------------------------------
+
+class TestBuildMmrRetriever:
+    def test_raises_when_vectorstore_dir_missing(self, sample_settings, tmp_path):
+        missing_dir = tmp_path / "no_such_dir"
+        with pytest.raises(VectorStoreNotFoundError):
+            build_mmr_retriever(missing_dir, sample_settings)
+
+    def test_raises_when_index_file_absent(self, sample_settings, tmp_path):
+        vs_dir = tmp_path / "vectorstore"
+        vs_dir.mkdir()
+        # No index.faiss written
+        with pytest.raises(VectorStoreNotFoundError):
+            build_mmr_retriever(vs_dir, sample_settings)
+
+    @patch("multi_doc_chat.src.retrieval.OpenAIEmbeddings")
+    @patch("multi_doc_chat.src.retrieval.FAISS")
+    def test_returns_retriever_when_index_exists(
+        self, mock_faiss_cls, mock_embeddings_cls, sample_settings, tmp_path, mock_faiss_vectorstore
+    ):
+        vs_dir = tmp_path / "vectorstore"
+        vs_dir.mkdir()
+        (vs_dir / "index.faiss").write_bytes(b"")
+
+        mock_embeddings_cls.return_value = MagicMock()
+        mock_faiss_cls.load_local.return_value = mock_faiss_vectorstore
+
+        retriever = build_mmr_retriever(vs_dir, sample_settings)
+
+        mock_faiss_vectorstore.as_retriever.assert_called_once()
+        call_kwargs = mock_faiss_vectorstore.as_retriever.call_args[1]
+        assert call_kwargs["search_type"] == "mmr"
+        assert call_kwargs["search_kwargs"]["k"] == sample_settings.retriever_k

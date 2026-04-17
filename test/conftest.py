@@ -18,8 +18,11 @@ def sample_settings(tmp_path: Path) -> Settings:
         chunk_size=200,
         chunk_overlap=20,
         retriever_k=3,
+        mmr_fetch_k=10,
+        mmr_lambda_mult=0.5,
         data_dir=tmp_path / "data",
         vectorstore_dir=tmp_path / "vectorstore",
+        sessions_dir=tmp_path / "sessions",
     )
 
 
