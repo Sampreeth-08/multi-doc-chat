@@ -15,6 +15,12 @@
           "protocol": "tcp"
         }
       ],
+      "environment": [
+        {
+          "name": "OPENAI_BASE_URL",
+          "value": "https://us.api.openai.com/v1"
+        }
+      ],
       "secrets": [
         {
           "name": "OPENAI_API_KEY",
