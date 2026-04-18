@@ -1,0 +1,35 @@
+{
+  "family": "multi-doc-chat",
+  "networkMode": "awsvpc",
+  "requiresCompatibilities": ["FARGATE"],
+  "cpu": "512",
+  "memory": "1024",
+  "executionRoleArn": "arn:aws:iam::491085415158:role/ecsTaskExecutionRole",
+  "containerDefinitions": [
+    {
+      "name": "multi-doc-chat",
+      "image": "491085415158.dkr.ecr.us-east-1.amazonaws.com/multi-doc-chat:latest",
+      "portMappings": [
+        {
+          "containerPort": 8000,
+          "protocol": "tcp"
+        }
+      ],
+      "secrets": [
+        {
+          "name": "OPENAI_API_KEY",
+          "valueFrom": "arn:aws:secretsmanager:us-east-1:491085415158:secret:multi-doc-chat/openai:OPENAI_API_KEY::"
+        }
+      ],
+      "logConfiguration": {
+        "logDriver": "awslogs",
+        "options": {
+          "awslogs-group": "/ecs/multi-doc-chat",
+          "awslogs-region": "us-east-1",
+          "awslogs-stream-prefix": "ecs"
+        }
+      },
+      "essential": true
+    }
+  ]
+}

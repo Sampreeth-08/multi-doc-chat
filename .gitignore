@@ -23,3 +23,6 @@ vectorstore/
 
 # Claude Code local settings
 .claude/settings.local.json
+
+# AWS credentials / secrets
+secrets/
